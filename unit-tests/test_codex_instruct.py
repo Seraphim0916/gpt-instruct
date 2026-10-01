@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -346,6 +347,48 @@ class ManagedConfigTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(custom_prompt.read_text(encoding="utf-8"), "user replacement\n")
         self.assertIn("./personal.md", config_path.read_text(encoding="utf-8"))
+
+    # A replacement symlink is user-owned even when its target matches the old prompt.
+    def test_reset_preserves_replacement_prompt_symlinks_without_reading_targets(self) -> None:
+        for target_kind in ["matching", "modified", "missing"]:
+            with self.subTest(target_kind=target_kind), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                home = root / "codex-home"
+                home.mkdir()
+                config_path = home / "config.toml"
+                original = 'model = "test-model"\nmodel_provider = "fixture"\n'
+                config_path.write_text(original, encoding="utf-8")
+                source = root / "source.md"
+                source.write_text("synthetic prompt\n", encoding="utf-8")
+                args = SimpleNamespace(codex_dir=str(home), dry_run=False)
+                self.assertEqual(codex_instruct.deploy_prompt(args, source, "custom.md"), 0)
+                self.assertEqual(codex_instruct.deploy_prompt(args, source, "owned.md"), 0)
+
+                target = root / "user-owned.md"
+                content = b"synthetic prompt\n" if target_kind == "matching" else b"user changed\n"
+                if target_kind != "missing":
+                    target.write_bytes(content)
+                prompt = home / "custom.md"
+                prompt.unlink()
+                prompt.symlink_to(target)
+                with patch("builtins.input", return_value="y"), patch("builtins.print") as output, patch.object(
+                    codex_instruct, "file_sha256", wraps=codex_instruct.file_sha256
+                ) as hash_file:
+                    result = codex_instruct.reset_managed_install(args)
+
+                self.assertEqual(result, 0)
+                self.assertTrue(prompt.is_symlink())
+                self.assertEqual(Path(os.readlink(prompt)), target)
+                hash_file.assert_called_once_with(home / "owned.md")
+                self.assertFalse((home / "owned.md").exists())
+                if target_kind == "missing":
+                    self.assertFalse(target.exists())
+                else:
+                    self.assertEqual(target.read_bytes(), content)
+                self.assertEqual(config_path.read_bytes(), original.encode("utf-8"))
+                self.assertFalse(codex_instruct.state_file_path(config_path).exists())
+                messages = "\n".join(" ".join(map(str, call.args)) for call in output.call_args_list)
+                self.assertIn("Removed 1, preserved 1", messages)
 
     # Atomic config writes follow a trusted config symlink instead of replacing the link itself.
     def test_atomic_config_update_preserves_symlink(self) -> None:

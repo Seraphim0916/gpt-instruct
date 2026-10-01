@@ -673,6 +673,7 @@ def reset_managed_install(args: argparse.Namespace) -> int:
             try:
                 digest_matches = (
                     not existed_before
+                    and not prompt_path.is_symlink()
                     and prompt_path.is_file()
                     and bool(expected_digest)
                     and file_sha256(prompt_path) == expected_digest
@@ -682,7 +683,7 @@ def reset_managed_install(args: argparse.Namespace) -> int:
             if digest_matches:
                 prompt_path.unlink()
                 removed += 1
-            elif prompt_path.exists():
+            elif prompt_path.exists() or prompt_path.is_symlink():
                 preserved += 1
                 reason = (
                     "部署前已存在 / pre-existing"
