@@ -197,12 +197,60 @@ def is_valid_instruction_line(line: object) -> bool:
     )
 
 
+def root_config_statements(lines: list[str]) -> tuple[list[tuple[int, int]], int]:
+    """Locate root statement spans without interpreting or reserializing TOML values."""
+    statements: list[tuple[int, int]] = []
+    quote = ""
+    depth = 0
+    start = 0
+    for line_index, line in enumerate(lines):
+        if not quote and depth == 0:
+            stripped = line.lstrip()
+            if stripped.startswith("["):
+                return statements, line_index
+            if not stripped or stripped.startswith("#"):
+                continue
+            start = line_index
+        index = 0
+        while index < len(line):
+            char = line[index]
+            if quote:
+                if quote[0] == '"' and char == "\\":
+                    index += 2
+                    continue
+                if line.startswith(quote, index):
+                    end = index + len(quote)
+                    if len(quote) == 3:
+                        # Four/five closing quotes include one/two literal quotes.
+                        while end < len(line) and line[end] == quote[0]:
+                            end += 1
+                    quote = ""
+                    index = end
+                    continue
+            elif char == "#":
+                break
+            elif char in "\"'":
+                quote = char * 3 if line.startswith(char * 3, index) else char
+                index += len(quote)
+                continue
+            elif char in "[{":
+                depth += 1
+            elif char in "]}":
+                depth -= 1
+            index += 1
+        if not quote and depth == 0:
+            if line_index > start and re.match(r"^\s*model_instructions_file\s*=", lines[start]):
+                raise ValueError("model_instructions_file must use a single-line TOML value")
+            statements.append((start, line_index + 1))
+    return statements, len(lines)
+
+
 def top_level_model_instructions_line(text: str) -> str | None:
     """Return the root model_instructions_file assignment, ignoring TOML tables."""
-    for line in text.splitlines():
-        stripped = line.lstrip()
-        if stripped.startswith("["):
-            break
+    lines = text.splitlines(keepends=True)
+    statements, _table_index = root_config_statements(lines)
+    for start, _end in statements:
+        line = lines[start].rstrip("\r\n")
         if re.match(r"^\s*model_instructions_file\s*=", line):
             return line
     return None
@@ -225,14 +273,11 @@ def line_references_managed_prompt(line: str | None, filenames: set[str]) -> boo
 def replace_top_level_model_instructions(text: str, replacement: str | None) -> str:
     """Replace only the root assignment while preserving all unrelated TOML text."""
     lines = text.splitlines(keepends=True)
-    table_index = next(
-        (index for index, line in enumerate(lines) if line.lstrip().startswith("[")),
-        len(lines),
-    )
+    statements, table_index = root_config_statements(lines)
     assignment_indexes = [
-        index
-        for index, line in enumerate(lines[:table_index])
-        if re.match(r"^\s*model_instructions_file\s*=", line)
+        start
+        for start, _end in statements
+        if re.match(r"^\s*model_instructions_file\s*=", lines[start])
     ]
 
     if assignment_indexes:
@@ -255,9 +300,9 @@ def replace_top_level_model_instructions(text: str, replacement: str | None) -> 
 
     insert_at = next(
         (
-            index + 1
-            for index, line in enumerate(lines[:table_index])
-            if re.match(r"^\s*model\s*=", line)
+            end
+            for start, end in statements
+            if re.match(r"^\s*model\s*=", lines[start])
         ),
         table_index,
     )
@@ -500,9 +545,13 @@ def deploy_prompt(
 
         state = read_state(config_path)
         tracked_prompts = state.get("managed_prompts", {}) if state else {}
-        current_line = top_level_model_instructions_line(
-            config_path.read_text(encoding="utf-8")
-        )
+        try:
+            current_line = top_level_model_instructions_line(
+                config_path.read_text(encoding="utf-8")
+            )
+        except ValueError as exc:
+            print(f"[错误] Unsupported configuration: {exc}", file=sys.stderr)
+            return 2
         legacy_owned = state is None and line_references_managed_prompt(
             current_line,
             {md_filename},
@@ -630,6 +679,12 @@ def reset_managed_install(args: argparse.Namespace) -> int:
     for codex_dir in codex_dirs:
         config_path = codex_dir / "config.toml"
         print(f"\n── 目标 / Target: {codex_dir} ──")
+        try:
+            if config_path.exists():
+                top_level_model_instructions_line(config_path.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            print(f"[错误] Unsupported configuration: {exc}", file=sys.stderr)
+            return 2
         state = read_state(config_path)
         managed_prompts = state.get("managed_prompts", {}) if state else {}
         assert isinstance(managed_prompts, dict)

@@ -222,6 +222,99 @@ class ManagedConfigTests(unittest.TestCase):
         self.assertEqual(text.count(nested_line), 1)
         self.assertNotIn("gpt-5.6-sol-unrestricted-v45.md", text)
 
+    def test_multiline_toml_values_survive_deploy_and_reset(self) -> None:
+        for delimiter in ['"""', "'''"]:
+            for previous_line in [None, 'model_instructions_file = "./personal.md" # keep']:
+                with self.subTest(delimiter=delimiter, previous_line=previous_line):
+                    quoted_content = (
+                        r'An escaped delimiter: \""" stays inside the string.'
+                        if delimiter == '"""' else "One ' and two '' literal quotes."
+                    )
+                    unrelated = (
+                        '# A comment containing """ is not a string opener.\n'
+                        'label = "Escaped \\"quote\\" and # text"\n'
+                        f'developer_instructions = {delimiter}\n'
+                        f'{quoted_content}\n'
+                        'model_instructions_file = "./example.md"\n'
+                        '[example.table]\n'
+                        'model = "example-only"\n'
+                        f'{delimiter}\n'
+                    )
+                    original = unrelated + 'model = "test-model"\n'
+                    if previous_line:
+                        original += previous_line + "\n"
+                    original += '\n[features]\nweb_search = true\n'
+                    parsed_original = tomllib.loads(original)
+                    temporary_directory, config_path = self.make_config(original)
+                    with temporary_directory:
+                        root = config_path.parent
+                        source = root / "source.md"
+                        source.write_text("synthetic prompt\n", encoding="utf-8")
+                        args = SimpleNamespace(codex_dir=str(root), dry_run=False)
+                        self.assertEqual(
+                            codex_instruct.top_level_model_instructions_line(original), previous_line
+                        )
+                        self.assertEqual(codex_instruct.deploy_prompt(args, source, "custom.md"), 0)
+                        deployed_text = config_path.read_text(encoding="utf-8")
+                        deployed = tomllib.loads(deployed_text)
+                        self.assertEqual(deployed["model_instructions_file"], "./custom.md")
+                        self.assertEqual(
+                            {key: value for key, value in deployed.items() if key != "model_instructions_file"},
+                            {key: value for key, value in parsed_original.items() if key != "model_instructions_file"},
+                        )
+                        self.assertTrue(deployed_text.startswith(unrelated))
+                        with patch("builtins.input", return_value="y"):
+                            self.assertEqual(codex_instruct.reset_managed_install(args), 0)
+                        self.assertEqual(config_path.read_bytes(), original.encode("utf-8"))
+
+    def test_config_insertion_skips_multiline_array_string_contents(self) -> None:
+        original = (
+            'notes = [\n  """\nmodel = "example"\n[example.table]\n""",\n'
+            '  "ordinary string", # ] is only a comment\n]\n'
+            '\n[features]\nweb_search = true\n'
+        )
+        updated = codex_instruct.replace_top_level_model_instructions(
+            original, 'model_instructions_file = "./custom.md"'
+        )
+        parsed = tomllib.loads(updated)
+        self.assertEqual(parsed["model_instructions_file"], "./custom.md")
+        self.assertEqual(parsed["notes"], tomllib.loads(original)["notes"])
+        self.assertEqual(
+            codex_instruct.replace_top_level_model_instructions(updated, None), original
+        )
+
+    def test_multiline_managed_values_are_rejected_before_deploy_or_reset_writes(self) -> None:
+        for value in ['"""\n./custom.md"""', "'''\n./custom.md'''", '"""\\\n./custom.md"""']:
+            for action in ["deploy", "reset"]:
+                with self.subTest(value=value, action=action):
+                    original = f'model = "test-model"\nmodel_instructions_file = {value}\n'
+                    self.assertEqual(tomllib.loads(original)["model_instructions_file"], "./custom.md")
+                    temporary_directory, config_path = self.make_config(original)
+                    with temporary_directory:
+                        root = config_path.parent
+                        source = root / "source.md"
+                        source.write_text("new synthetic prompt\n", encoding="utf-8")
+                        owned = root / "custom.md"
+                        owned.write_text("old synthetic prompt\n", encoding="utf-8")
+                        codex_instruct.save_state(config_path, {
+                            "version": codex_instruct.STATE_VERSION,
+                            "previous_model_instructions_line": None,
+                            "managed_prompts": {owned.name: {
+                                "sha256": codex_instruct.file_sha256(owned), "existed_before": False,
+                            }},
+                        })
+                        before = {path.name: path.read_bytes() for path in root.iterdir()}
+                        args = SimpleNamespace(codex_dir=str(root), dry_run=False)
+                        with patch("builtins.input", return_value="y"), patch("builtins.print"):
+                            result = (
+                                codex_instruct.deploy_prompt(args, source, "new.md")
+                                if action == "deploy" else codex_instruct.reset_managed_install(args)
+                            )
+                        self.assertEqual(result, 2)
+                        self.assertEqual(
+                            {path.name: path.read_bytes() for path in root.iterdir()}, before
+                        )
+
     # Legacy backups contribute only the prior instruction entry, never stale provider data.
     def test_legacy_baseline_migrates_only_previous_instruction(self) -> None:
         temporary_directory, config_path = self.make_config(
