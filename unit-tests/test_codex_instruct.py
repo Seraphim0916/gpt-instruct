@@ -33,6 +33,69 @@ class ManagedConfigTests(unittest.TestCase):
         config_path.write_text(text, encoding="utf-8")
         return temporary_directory, config_path
 
+    def test_prompt_filename_validation_preserves_safe_unicode_names(self) -> None:
+        invalid = [
+            None, 7, "", ".", "..", "config.toml", "../prompt.md",
+            "/tmp/prompt.md", "folder/prompt.md", r"folder\prompt.md",
+            r"C:\prompt.md", r"\\server\prompt.md", 'quoted"name.md',
+        ]
+        invalid.extend(f"prompt{chr(code)}name.md" for code in range(32))
+        invalid.extend(f"prompt{char}name.md" for char in "\x7f\x85\u2028\u2029\ud800\udfff")
+        for filename in invalid:
+            with self.subTest(filename=filename):
+                self.assertFalse(codex_instruct.is_safe_prompt_filename(filename))
+        for filename in ["提示詞.md", "author's notes.md", "test-🧪.md", "prompt.MD"]:
+            with self.subTest(filename=filename):
+                self.assertTrue(codex_instruct.is_safe_prompt_filename(filename))
+
+    def test_unsafe_custom_name_is_rejected_before_any_deployment_write(self) -> None:
+        for filename in [
+            'prompt"\ninjected_setting = true\n# .md',
+            'quoted"name.md', "nul\0name.md", "line\u2028name.md", "broken\ud800.md",
+            r"..\prompt.md",
+        ]:
+            with self.subTest(filename=filename):
+                temporary_directory, config_path = self.make_config(
+                    'model = "test-model"\nmodel_provider = "fixture"\n'
+                )
+                with temporary_directory:
+                    root = config_path.parent
+                    source = root / "source.md"
+                    source.write_text("synthetic prompt\n", encoding="utf-8")
+                    before = {path.name: path.read_bytes() for path in root.iterdir()}
+                    with patch.object(sys, "argv", [
+                        "codex-instruct.py", "--file", str(source),
+                        "--name", filename, "--codex-dir", str(root),
+                    ]), patch("builtins.print"):
+                        result = codex_instruct.main()
+                    self.assertEqual(result, 2)
+                    self.assertEqual(
+                        {path.name: path.read_bytes() for path in root.iterdir()}, before
+                    )
+                    self.assertFalse(codex_instruct.state_file_path(config_path).exists())
+
+    def test_unicode_custom_name_deploy_reset_preserves_unrelated_config(self) -> None:
+        original = 'model = "test-model"\n[features]\nweb_search = true\n'
+        temporary_directory, config_path = self.make_config(original)
+        self.addCleanup(temporary_directory.cleanup)
+        root = config_path.parent
+        source = root / "source.md"
+        source.write_text("synthetic prompt\n", encoding="utf-8")
+        filename = "個人's notes 🧪.md"
+        args = SimpleNamespace(codex_dir=str(root), dry_run=False)
+
+        self.assertEqual(codex_instruct.deploy_prompt(args, source, filename), 0)
+        deployed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(deployed["model_instructions_file"], f"./{filename}")
+        self.assertEqual(deployed["model"], "test-model")
+        self.assertTrue(deployed["features"]["web_search"])
+        self.assertEqual((root / filename).read_bytes(), source.read_bytes())
+        with patch("builtins.input", return_value="y"):
+            self.assertEqual(codex_instruct.reset_managed_install(args), 0)
+        self.assertEqual(config_path.read_bytes(), original.encode("utf-8"))
+        self.assertFalse((root / filename).exists())
+        self.assertFalse(codex_instruct.state_file_path(config_path).exists())
+
     def test_gpt56_v45_is_the_stable_default_release(self) -> None:
         self.assertEqual(codex_instruct.DEFAULT_PROMPT_VERSION, "gpt-5.6-v45")
         self.assertEqual(

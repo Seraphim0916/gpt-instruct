@@ -158,11 +158,19 @@ def state_file_path(config_path: Path) -> Path:
 
 
 def is_safe_prompt_filename(filename: object) -> bool:
+    """Accept a basename safe for a single-line, double-quoted TOML value."""
     return (
         isinstance(filename, str)
         and bool(filename)
         and "/" not in filename
         and "\\" not in filename
+        # Exclude scanner line boundaries and invalid UTF-8 surrogate code points.
+        and not any(
+            ord(char) < 32
+            or 0xD800 <= ord(char) <= 0xDFFF
+            or char in '"\x7f\x85\u2028\u2029'
+            for char in filename
+        )
         and filename.lower().endswith(".md")
         and Path(filename).name == filename
     )
@@ -445,7 +453,10 @@ def deploy_prompt(
     md_filename: str,
 ) -> int:
     if not is_safe_prompt_filename(md_filename):
-        print(f"[错误] 目标名称必须是不含路径的 .md 文件名: {md_filename}", file=sys.stderr)
+        print(
+            f"[错误] 目标名称必须是有效 UTF-8 且不含路径、双引号或控制/换行字符的 .md 文件名: {md_filename!r}",
+            file=sys.stderr,
+        )
         return 2
     if not prompt_path.exists():
         print(f"[错误] 提示词文件不存在: {prompt_path}", file=sys.stderr)
