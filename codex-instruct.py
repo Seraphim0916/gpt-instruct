@@ -133,7 +133,7 @@ def find_codex_dirs() -> list[Path]:
     if env_home:
         candidates.add(Path(env_home).expanduser())
     candidates.add(Path.home() / ".codex")
-    return sorted(path.resolve() for path in candidates if (path / "config.toml").exists())
+    return sorted({path.resolve() for path in candidates if (path / "config.toml").exists()})
 
 
 def selected_codex_dirs(codex_dir: str | None) -> list[Path]:

@@ -27,6 +27,90 @@ codex_instruct = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(codex_instruct)
 
 
+class CodexDiscoveryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        self.root = Path(temporary_directory.name).resolve()
+        self.home = self.root / "home"
+        self.codex_home = self.home / ".codex"
+        self.codex_home.mkdir(parents=True)
+        self.config_path = self.codex_home / "config.toml"
+        self.original_config = 'model = "test-model"\n'
+        self.config_path.write_text(self.original_config, encoding="utf-8")
+
+        previous_cwd = Path.cwd()
+        os.chdir(self.home)
+        self.addCleanup(os.chdir, previous_cwd)
+        home_patch = patch.object(Path, "home", return_value=self.home)
+        home_patch.start()
+        self.addCleanup(home_patch.stop)
+        env_patch = patch.dict(os.environ, {"CODEX_HOME": ".codex"})
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+
+    def test_relative_and_absolute_aliases_are_returned_once(self) -> None:
+        for env_home in [".codex", "./.codex", str(self.codex_home)]:
+            with self.subTest(env_home=env_home):
+                with patch.dict(os.environ, {"CODEX_HOME": env_home}):
+                    self.assertEqual(codex_instruct.find_codex_dirs(), [self.codex_home])
+        self.assertEqual(self.config_path.read_text(encoding="utf-8"), self.original_config)
+
+    def test_symlink_alias_is_returned_once(self) -> None:
+        alias = self.root / "codex-alias"
+        try:
+            alias.symlink_to(self.codex_home, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"Directory symlinks are unavailable: {exc}")
+        with patch.dict(os.environ, {"CODEX_HOME": str(alias)}):
+            self.assertEqual(codex_instruct.find_codex_dirs(), [self.codex_home])
+        self.assertTrue(alias.is_symlink())
+
+    def test_distinct_config_directories_are_both_returned_in_sorted_order(self) -> None:
+        other_home = self.root / "another-codex"
+        other_home.mkdir()
+        (other_home / "config.toml").write_text('model = "other-model"\n', encoding="utf-8")
+        with patch.dict(os.environ, {"CODEX_HOME": str(other_home)}):
+            self.assertEqual(
+                codex_instruct.find_codex_dirs(), sorted([self.codex_home, other_home])
+            )
+
+    def test_directories_without_config_are_excluded(self) -> None:
+        other_home = self.root / "empty-codex"
+        other_home.mkdir()
+        with patch.dict(os.environ, {"CODEX_HOME": str(other_home)}):
+            self.assertEqual(codex_instruct.find_codex_dirs(), [self.codex_home])
+            self.config_path.unlink()
+            self.assertEqual(codex_instruct.find_codex_dirs(), [])
+        self.assertEqual(list(other_home.iterdir()), [])
+
+    def test_deploy_visits_aliased_config_directory_once(self) -> None:
+        source = self.root / "source.md"
+        source.write_text("synthetic prompt\n", encoding="utf-8")
+        destination = self.codex_home / "custom.md"
+        args = SimpleNamespace(codex_dir=None, dry_run=False)
+        with patch.object(
+            codex_instruct, "backup_file", wraps=codex_instruct.backup_file
+        ) as backup, patch.object(
+            codex_instruct, "atomic_write_text", wraps=codex_instruct.atomic_write_text
+        ) as write, patch("builtins.print"):
+            result = codex_instruct.deploy_prompt(args, source, destination.name)
+
+        self.assertEqual(result, 0)
+        backup.assert_called_once_with(self.config_path)
+        self.assertEqual(
+            [call.args[0] for call in write.call_args_list].count(destination), 1
+        )
+        snapshots = list(self.codex_home.glob("config.toml.bak_*"))
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(snapshots[0].read_text(encoding="utf-8"), self.original_config)
+        self.assertEqual(destination.read_bytes(), source.read_bytes())
+        self.assertEqual(
+            tomllib.loads(self.config_path.read_text(encoding="utf-8")),
+            {"model": "test-model", "model_instructions_file": "./custom.md"},
+        )
+
+
 class ManagedConfigTests(unittest.TestCase):
     def make_config(self, text: str) -> tuple[tempfile.TemporaryDirectory[str], Path]:
         temporary_directory = tempfile.TemporaryDirectory()
