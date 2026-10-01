@@ -809,7 +809,7 @@ def inferred_md_filename(source: Path, requested_name: str | None) -> str:
     return f"{source.stem}.md"
 
 
-def main() -> int:
+def run_cli() -> int:
     parser = argparse.ArgumentParser(
         description="Extract, deploy, or reset a packaged gpt-instruct Codex instruction file."
     )
@@ -866,6 +866,14 @@ def main() -> int:
     _, version = action.split(":", 1)
     prompt_archive, prompt_md_filename = PROMPT_VERSIONS[version]
     return deploy_prompt(args, prompt_archive, prompt_md_filename)
+
+
+def main() -> int:
+    try:
+        return run_cli()
+    except OSError as exc:
+        print(f"[错误] 文件操作失败 / File operation failed: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -117,6 +118,85 @@ class ManagedConfigTests(unittest.TestCase):
         config_path = Path(temporary_directory.name) / "config.toml"
         config_path.write_text(text, encoding="utf-8")
         return temporary_directory, config_path
+
+    def run_cli_in_fixture(self, root: Path, arguments: list[str], answer: str = ""):
+        environment = os.environ.copy()
+        environment.update(
+            HOME=str(root), CODEX_HOME=str(root),
+            XDG_CONFIG_HOME=str(root / "xdg"), TMPDIR=str(root),
+        )
+        return subprocess.run(
+            [sys.executable, "-I", str(PROJECT_ROOT / "codex-instruct.py"), *arguments],
+            cwd=root, env=environment, input=answer, capture_output=True,
+            encoding="utf-8", timeout=10,
+        )
+
+    def fixture_contents(self, root: Path) -> dict:
+        return {
+            str(path.relative_to(root)): None if path.is_dir() else path.read_bytes()
+            for path in root.rglob("*")
+        }
+
+    def test_cli_reports_file_type_errors_without_tracebacks_or_changes(self) -> None:
+        for case in ["target-file", "config-directory-deploy", "config-directory-reset"]:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source = root / "source.md"
+                source.write_text("synthetic prompt\n", encoding="utf-8")
+                target = root / "codex"
+                if case == "target-file":
+                    target.write_text("keep this existing file\n", encoding="utf-8")
+                else:
+                    config = target / "config.toml"
+                    config.mkdir(parents=True)
+                    (config / "notes.txt").write_text("keep this folder\n", encoding="utf-8")
+                arguments = (
+                    ["--reset"] if case.endswith("reset")
+                    else ["--file", str(source), "--name", "custom.md"]
+                ) + ["--codex-dir", str(target)]
+                before = self.fixture_contents(root)
+                result = self.run_cli_in_fixture(root, arguments, "y\n")
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("File operation failed", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertNotIn("keep this", result.stderr)
+                self.assertEqual(self.fixture_contents(root), before)
+
+    def test_cli_preserves_preview_cancel_success_and_argument_error_behavior(self) -> None:
+        original = 'model = "test-model"\n'
+        temporary_directory, config_path = self.make_config(original)
+        self.addCleanup(temporary_directory.cleanup)
+        root = config_path.parent
+        source = root / "source.md"
+        source.write_text("synthetic prompt\n", encoding="utf-8")
+        deploy = ["--file", str(source), "--name", "custom.md", "--codex-dir", str(root)]
+        reset = ["--reset", "--codex-dir", str(root)]
+        before = self.fixture_contents(root)
+        preview = self.run_cli_in_fixture(root, deploy + ["--dry-run"])
+        self.assertEqual(preview.returncode, 0)
+        self.assertEqual(preview.stderr, "")
+        self.assertEqual(self.fixture_contents(root), before)
+        self.assertEqual(self.run_cli_in_fixture(root, deploy).returncode, 0)
+        deployed = self.fixture_contents(root)
+        self.assertEqual(self.run_cli_in_fixture(root, reset, "n\n").returncode, 0)
+        self.assertEqual(self.fixture_contents(root), deployed)
+        self.assertEqual(self.run_cli_in_fixture(root, reset, "y\n").returncode, 0)
+        self.assertEqual(config_path.read_text(encoding="utf-8"), original)
+        self.assertFalse((root / "custom.md").exists())
+        before_invalid_argument = self.fixture_contents(root)
+        invalid = self.run_cli_in_fixture(root, ["--version", "gpt-6-v1"])
+        self.assertEqual(invalid.returncode, 2)
+        self.assertIn("--version requires --apply", invalid.stderr)
+        self.assertNotIn("File operation failed", invalid.stderr)
+        self.assertEqual(self.fixture_contents(root), before_invalid_argument)
+
+    def test_cli_does_not_swallow_non_filesystem_exceptions(self) -> None:
+        for error in [ValueError("unexpected value"), RuntimeError("unexpected failure")]:
+            with self.subTest(error=type(error).__name__), patch.object(
+                sys, "argv", ["codex-instruct.py", "--file", "source.md"]
+            ), patch.object(codex_instruct, "deploy_prompt", side_effect=error):
+                with self.assertRaises(type(error)):
+                    codex_instruct.main()
 
     def test_prompt_filename_validation_preserves_safe_unicode_names(self) -> None:
         invalid = [
