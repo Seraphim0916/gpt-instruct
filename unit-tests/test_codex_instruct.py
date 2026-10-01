@@ -367,6 +367,70 @@ class ManagedConfigTests(unittest.TestCase):
             codex_instruct.replace_top_level_model_instructions(updated, None), original
         )
 
+    def test_unicode_line_separators_in_comments_preserve_root_settings(self) -> None:
+        for separator in ["\u0085", "\u2028", "\u2029"]:
+            for previous_line in [None, 'model_instructions_file = "./personal.md" # keep']:
+                with self.subTest(separator=repr(separator), previous_line=previous_line):
+                    original = (
+                        f'# Documentation excerpt:{separator}[features]\n'
+                        f'model = "test-model" # Model notes:{separator}[profile.example]\n'
+                    )
+                    if previous_line:
+                        original += previous_line + "\n"
+                    original += '[profiles.work]\nmodel = "nested-model"\n'
+                    parsed_original = tomllib.loads(original)
+                    temporary_directory, config_path = self.make_config(original)
+                    with temporary_directory:
+                        root = config_path.parent
+                        source = root / "source.md"
+                        source.write_text("synthetic prompt\n", encoding="utf-8")
+                        args = SimpleNamespace(codex_dir=str(root), dry_run=False)
+                        with patch("builtins.print"):
+                            result = codex_instruct.deploy_prompt(args, source, "custom.md")
+                        self.assertEqual(result, 0)
+                        expected = dict(parsed_original, model_instructions_file="./custom.md")
+                        self.assertEqual(
+                            tomllib.loads(config_path.read_text(encoding="utf-8")), expected
+                        )
+                        with patch("builtins.print"), patch("builtins.input", return_value="y"):
+                            self.assertEqual(codex_instruct.reset_managed_install(args), 0)
+                        self.assertEqual(config_path.read_bytes(), original.encode("utf-8"))
+
+    def test_unicode_separators_in_multiline_values_survive_config_edits(self) -> None:
+        for separator in ["\u0085", "\u2028", "\u2029"]:
+            for delimiter in ['"""', "'''"]:
+                with self.subTest(separator=repr(separator), delimiter=delimiter):
+                    original = (
+                        f'notes = {delimiter}First{separator}second\n'
+                        f'Third{separator}[features]{delimiter}\n'
+                        'model = "test-model"\n[profiles.work]\nmodel = "nested-model"\n'
+                    )
+                    expected = tomllib.loads(original)
+                    expected["model_instructions_file"] = "./custom.md"
+                    updated = codex_instruct.replace_top_level_model_instructions(
+                        original, 'model_instructions_file = "./custom.md"'
+                    )
+                    self.assertEqual(tomllib.loads(updated), expected)
+                    self.assertEqual(
+                        codex_instruct.replace_top_level_model_instructions(updated, None), original
+                    )
+
+    def test_config_line_boundaries_preserve_crlf_and_unterminated_last_line(self) -> None:
+        previous = 'model_instructions_file = "./personal.md"'
+        replacement = 'model_instructions_file = "./custom.md"'
+        for newline in ["\n", "\r\n"]:
+            for last_newline in ["", newline]:
+                with self.subTest(newline=repr(newline), last_newline=repr(last_newline)):
+                    original = (
+                        f'# Documentation excerpt:\u2028[features]{newline}'
+                        f'model = "test-model"{newline}{previous}{last_newline}'
+                    )
+                    updated = codex_instruct.replace_top_level_model_instructions(original, replacement)
+                    self.assertEqual(updated, original.replace(previous, replacement))
+                    self.assertEqual(
+                        codex_instruct.replace_top_level_model_instructions(updated, previous), original
+                    )
+
     def test_multiline_managed_values_are_rejected_before_deploy_or_reset_writes(self) -> None:
         for value in ['"""\n./custom.md"""', "'''\n./custom.md'''", '"""\\\n./custom.md"""']:
             for action in ["deploy", "reset"]:

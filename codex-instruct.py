@@ -214,6 +214,12 @@ def quoted_root_key(line: str) -> str | None:
     return re.sub(r'\\(u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|["\\btnfr])', decode, token[1:-1])
 
 
+def split_toml_lines(text: str) -> list[str]:
+    """Split only at TOML LF/CRLF boundaries, preserving every input character."""
+    parts = text.split("\n")
+    return [part + "\n" for part in parts[:-1]] + ([parts[-1]] if parts[-1] else [])
+
+
 def root_config_statements(lines: list[str]) -> tuple[list[tuple[int, int]], int]:
     """Locate root statement spans without interpreting or reserializing TOML values."""
     statements: list[tuple[int, int]] = []
@@ -268,7 +274,7 @@ def root_config_statements(lines: list[str]) -> tuple[list[tuple[int, int]], int
 
 def top_level_model_instructions_line(text: str) -> str | None:
     """Return the root model_instructions_file assignment, ignoring TOML tables."""
-    lines = text.splitlines(keepends=True)
+    lines = split_toml_lines(text)
     statements, _table_index = root_config_statements(lines)
     for start, _end in statements:
         line = lines[start].rstrip("\r\n")
@@ -293,7 +299,7 @@ def line_references_managed_prompt(line: str | None, filenames: set[str]) -> boo
 
 def replace_top_level_model_instructions(text: str, replacement: str | None) -> str:
     """Replace only the root assignment while preserving all unrelated TOML text."""
-    lines = text.splitlines(keepends=True)
+    lines = split_toml_lines(text)
     statements, table_index = root_config_statements(lines)
     assignment_indexes = [
         start
