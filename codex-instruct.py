@@ -197,6 +197,23 @@ def is_valid_instruction_line(line: object) -> bool:
     )
 
 
+def quoted_root_key(line: str) -> str | None:
+    """Decode only a leading quoted key token, including TOML Unicode escapes."""
+    match = re.match(r"""^\s*("(?:\\.|[^"\\])*"|'[^']*')\s*(?=[=.])""", line)
+    if match is None:
+        return None
+    token = match.group(1)
+    if token.startswith("'"):
+        return token[1:-1]
+    escapes = {"b": "\b", "t": "\t", "n": "\n", "f": "\f", "r": "\r", '"': '"', "\\": "\\"}
+
+    def decode(escape_match: re.Match[str]) -> str:
+        escape = escape_match.group(1)
+        return chr(int(escape[1:], 16)) if escape[0] in "uU" else escapes[escape]
+
+    return re.sub(r'\\(u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|["\\btnfr])', decode, token[1:-1])
+
+
 def root_config_statements(lines: list[str]) -> tuple[list[tuple[int, int]], int]:
     """Locate root statement spans without interpreting or reserializing TOML values."""
     statements: list[tuple[int, int]] = []
@@ -206,6 +223,10 @@ def root_config_statements(lines: list[str]) -> tuple[list[tuple[int, int]], int
     for line_index, line in enumerate(lines):
         if not quote and depth == 0:
             stripped = line.lstrip()
+            if quoted_root_key(line) == "model_instructions_file" or re.match(
+                r"^\s*model_instructions_file\s*\.", line
+            ):
+                raise ValueError("model_instructions_file must use its bare, undotted key")
             if stripped.startswith("["):
                 return statements, line_index
             if not stripped or stripped.startswith("#"):

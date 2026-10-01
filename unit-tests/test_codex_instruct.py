@@ -315,6 +315,63 @@ class ManagedConfigTests(unittest.TestCase):
                             {path.name: path.read_bytes() for path in root.iterdir()}, before
                         )
 
+    def test_unsupported_managed_keys_are_rejected_before_deploy_or_reset_writes(self) -> None:
+        for key in [
+            '"model_instructions_file"', "'model_instructions_file'",
+            r'"\u006dodel_instructions_file"', r'"\U0000006dodel_instructions_file"',
+            r'"model_instructions_\u0066ile"', '"model_instructions_file".nested',
+            'model_instructions_file.nested',
+        ]:
+            for action in ["deploy", "reset"]:
+                with self.subTest(key=key, action=action):
+                    original = f'model = "test-model"\n{key} = "./custom.md"\n'
+                    self.assertIn("model_instructions_file", tomllib.loads(original))
+                    temporary_directory, config_path = self.make_config(original)
+                    with temporary_directory:
+                        root = config_path.parent
+                        source = root / "source.md"
+                        source.write_text("new synthetic prompt\n", encoding="utf-8")
+                        owned = root / "custom.md"
+                        owned.write_text("old synthetic prompt\n", encoding="utf-8")
+                        codex_instruct.save_state(config_path, {
+                            "version": codex_instruct.STATE_VERSION,
+                            "previous_model_instructions_line": None,
+                            "managed_prompts": {owned.name: {
+                                "sha256": codex_instruct.file_sha256(owned), "existed_before": False,
+                            }},
+                        })
+                        before = {path.name: path.read_bytes() for path in root.iterdir()}
+                        args = SimpleNamespace(codex_dir=str(root), dry_run=False)
+                        with patch("builtins.input", return_value="y"), patch("builtins.print"):
+                            result = (
+                                codex_instruct.deploy_prompt(args, source, "new.md")
+                                if action == "deploy" else codex_instruct.reset_managed_install(args)
+                            )
+                        self.assertEqual(result, 2)
+                        self.assertEqual(
+                            {path.name: path.read_bytes() for path in root.iterdir()}, before
+                        )
+
+    def test_unrelated_quoted_and_nested_keys_are_preserved(self) -> None:
+        for key in [
+            '"unrelated key"', '"model_instructions_file.example"',
+            r'"\\u006dodel_instructions_file"', '"profile".model_instructions_file',
+            '"配置".option', '"Model_instructions_file"',
+        ]:
+            with self.subTest(key=key):
+                previous = 'model_instructions_file = "./personal.md" # keep'
+                original = f'{key} = "kept"\nmodel = "test-model"\n{previous}\n'
+                updated = codex_instruct.replace_top_level_model_instructions(
+                    original, 'model_instructions_file = "./custom.md"'
+                )
+                expected = tomllib.loads(original)
+                expected["model_instructions_file"] = "./custom.md"
+                self.assertEqual(tomllib.loads(updated), expected)
+                self.assertEqual(codex_instruct.top_level_model_instructions_line(original), previous)
+                self.assertEqual(
+                    codex_instruct.replace_top_level_model_instructions(updated, previous), original
+                )
+
     # Legacy backups contribute only the prior instruction entry, never stale provider data.
     def test_legacy_baseline_migrates_only_previous_instruction(self) -> None:
         temporary_directory, config_path = self.make_config(
