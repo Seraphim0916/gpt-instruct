@@ -340,7 +340,15 @@ def replace_top_level_model_instructions(text: str, replacement: str | None) -> 
     return "".join(lines)
 
 
-def atomic_write_text(path: Path, text: str, *, follow_symlink: bool = False) -> None:
+def read_config_text(path: Path) -> str:
+    """Read configuration text without translating its existing newline characters."""
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return handle.read()
+
+
+def atomic_write_text(
+    path: Path, text: str, *, follow_symlink: bool = False, preserve_newlines: bool = False,
+) -> None:
     """Atomically update text, following symlinks only for explicitly trusted paths."""
     if path.is_symlink() and not follow_symlink:
         raise OSError(f"refusing to overwrite symlink: {path}")
@@ -352,7 +360,9 @@ def atomic_write_text(path: Path, text: str, *, follow_symlink: bool = False) ->
     )
     temporary_path = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        with os.fdopen(
+            descriptor, "w", encoding="utf-8", newline="" if preserve_newlines else None,
+        ) as handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
@@ -415,7 +425,7 @@ def previous_instruction_from_legacy_baseline(config_path: Path) -> str | None:
     baseline = baseline_backup_path(config_path)
     if not baseline.exists():
         return None
-    line = top_level_model_instructions_line(baseline.read_text(encoding="utf-8"))
+    line = top_level_model_instructions_line(read_config_text(baseline))
     if line_references_managed_prompt(line, MANAGED_PROMPT_FILENAMES):
         return None
     return line
@@ -430,7 +440,7 @@ def prepare_deployment_state(
     state = read_state(config_path)
     if state is None:
         current_line = top_level_model_instructions_line(
-            config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+            read_config_text(config_path) if config_path.exists() else ""
         )
         if line_references_managed_prompt(
             current_line,
@@ -460,11 +470,11 @@ def prepare_deployment_state(
 
 
 def set_model_instructions(config_path: Path, md_filename: str) -> bool:
-    text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    text = read_config_text(config_path) if config_path.exists() else ""
     target = f'model_instructions_file = "./{md_filename}"'
     new_text = replace_top_level_model_instructions(text, target)
     if new_text != text:
-        atomic_write_text(config_path, new_text, follow_symlink=True)
+        atomic_write_text(config_path, new_text, follow_symlink=True, preserve_newlines=True)
         return True
     return False
 
@@ -480,7 +490,7 @@ def restore_managed_model_instructions(config_path: Path) -> tuple[bool, str]:
         if isinstance(stored_prompts, dict):
             managed_filenames.update(stored_prompts)
 
-    text = config_path.read_text(encoding="utf-8")
+    text = read_config_text(config_path)
     current_line = top_level_model_instructions_line(text)
     if not line_references_managed_prompt(current_line, managed_filenames):
         return False, "not-managed"
@@ -493,7 +503,7 @@ def restore_managed_model_instructions(config_path: Path) -> tuple[bool, str]:
 
     new_text = replace_top_level_model_instructions(text, previous_line)
     if new_text != text:
-        atomic_write_text(config_path, new_text, follow_symlink=True)
+        atomic_write_text(config_path, new_text, follow_symlink=True, preserve_newlines=True)
         return True, "restored" if previous_line else "removed"
     return False, "unchanged"
 
@@ -559,7 +569,7 @@ def deploy_prompt(
 
         codex_dir.mkdir(parents=True, exist_ok=True)
         if not config_path.exists():
-            atomic_write_text(config_path, "", follow_symlink=True)
+            atomic_write_text(config_path, "", follow_symlink=True, preserve_newlines=True)
             print("  创建 / Created: config.toml")
 
         if state_file_path(config_path).is_symlink():
@@ -574,7 +584,7 @@ def deploy_prompt(
         tracked_prompts = state.get("managed_prompts", {}) if state else {}
         try:
             current_line = top_level_model_instructions_line(
-                config_path.read_text(encoding="utf-8")
+                read_config_text(config_path)
             )
         except ValueError as exc:
             print(f"[错误] Unsupported configuration: {exc}", file=sys.stderr)
@@ -674,7 +684,7 @@ def restore_config_snapshot(args: argparse.Namespace, snapshot: Path) -> int:
         return 2
 
     try:
-        snapshot_text = snapshot.read_text(encoding="utf-8")
+        snapshot_text = read_config_text(snapshot)
     except (OSError, UnicodeError) as exc:
         print(f"[错误] 无法读取快照 / Failed to read snapshot: {exc}", file=sys.stderr)
         return 2
@@ -692,7 +702,7 @@ def restore_config_snapshot(args: argparse.Namespace, snapshot: Path) -> int:
     if config_path.exists():
         safety_snapshot = backup_file(config_path)
         print(f"  已备份当前配置 / Current config saved: {safety_snapshot.name}")
-    atomic_write_text(config_path, snapshot_text, follow_symlink=True)
+    atomic_write_text(config_path, snapshot_text, follow_symlink=True, preserve_newlines=True)
     print("  已完整恢复 config.toml / Full config.toml restored.")
     return 0
 
@@ -708,7 +718,7 @@ def reset_managed_install(args: argparse.Namespace) -> int:
         print(f"\n── 目标 / Target: {codex_dir} ──")
         try:
             if config_path.exists():
-                top_level_model_instructions_line(config_path.read_text(encoding="utf-8"))
+                top_level_model_instructions_line(read_config_text(config_path))
         except ValueError as exc:
             print(f"[错误] Unsupported configuration: {exc}", file=sys.stderr)
             return 2

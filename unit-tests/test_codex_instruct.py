@@ -670,6 +670,96 @@ class ManagedConfigTests(unittest.TestCase):
 
         self.assertNotIn("\n", updated.replace("\r\n", ""))
 
+    def test_disk_config_newlines_survive_deploy_and_reset(self) -> None:
+        for newline in ["\n", "\r\n"]:
+            for trailing in [False, True]:
+                for previous in [None, 'model_instructions_file = "./personal.md" # keep']:
+                    for linked in [False, True]:
+                        with self.subTest(newline=repr(newline), trailing=trailing, previous=previous, linked=linked):
+                            lines = ['# keep this comment', 'model = "test-model"']
+                            if previous:
+                                lines.append(previous)
+                            lines += ['', '[features]', 'web_search = true']
+                            original = newline.join(lines) + (newline if trailing else "")
+                            temporary_directory, config_path = self.make_config("")
+                            with temporary_directory:
+                                root = config_path.parent
+                                config_path.write_bytes(original.encode("utf-8"))
+                                config_path.chmod(0o640)
+                                if linked:
+                                    backing = root / "backing.toml"
+                                    config_path.rename(backing)
+                                    config_path.symlink_to(backing)
+                                source = root / "source.md"
+                                source.write_text("synthetic prompt\n", encoding="utf-8")
+                                args = SimpleNamespace(codex_dir=str(root), dry_run=False)
+                                with patch("builtins.print"):
+                                    self.assertEqual(codex_instruct.deploy_prompt(args, source, "custom.md"), 0)
+                                expected = codex_instruct.replace_top_level_model_instructions(
+                                    original, 'model_instructions_file = "./custom.md"'
+                                )
+                                self.assertEqual(config_path.read_bytes(), expected.encode("utf-8"))
+                                self.assertEqual(
+                                    tomllib.loads(config_path.read_bytes().decode("utf-8")),
+                                    dict(tomllib.loads(original), model_instructions_file="./custom.md"),
+                                )
+                                snapshots = list(root.glob("config.toml.bak_*"))
+                                self.assertEqual(len(snapshots), 1)
+                                self.assertEqual(snapshots[0].read_bytes(), original.encode("utf-8"))
+                                with patch("builtins.print"), patch("builtins.input", return_value="y"):
+                                    self.assertEqual(codex_instruct.reset_managed_install(args), 0)
+                                self.assertEqual(config_path.read_bytes(), original.encode("utf-8"))
+                                self.assertEqual(config_path.stat().st_mode & 0o777, 0o640)
+                                self.assertEqual(config_path.is_symlink(), linked)
+
+    def test_snapshot_restore_preserves_snapshot_newline_bytes(self) -> None:
+        for newline in ["\n", "\r\n"]:
+            for trailing in [False, True]:
+                with self.subTest(newline=repr(newline), trailing=trailing):
+                    temporary_directory, config_path = self.make_config("")
+                    with temporary_directory:
+                        root = config_path.parent
+                        original = b'model = "current-model"\r\n'
+                        config_path.write_bytes(original)
+                        config_path.chmod(0o640)
+                        snapshot = root / "config.toml.bak_fixture"
+                        saved = newline.join(['# snapshot comment', 'model = "saved-model"'])
+                        saved += newline if trailing else ""
+                        snapshot.write_bytes(saved.encode("utf-8"))
+                        args = SimpleNamespace(codex_dir=str(root), dry_run=False)
+                        with patch("builtins.print"), patch("builtins.input", return_value="y"):
+                            self.assertEqual(codex_instruct.restore_config_snapshot(args, snapshot), 0)
+                        self.assertEqual(config_path.read_bytes(), snapshot.read_bytes())
+                        backups = [path for path in root.glob("config.toml.bak_*") if path != snapshot]
+                        self.assertEqual(len(backups), 1)
+                        self.assertEqual(backups[0].read_bytes(), original)
+                        self.assertEqual(config_path.stat().st_mode & 0o777, 0o640)
+
+    def test_newline_preservation_is_opt_in_for_config_writes(self) -> None:
+        temporary_directory, config_path = self.make_config("")
+        self.addCleanup(temporary_directory.cleanup)
+        config_path.write_bytes(b'model = "test-model"\r\n')
+        root = config_path.parent
+        source = root / "source.md"
+        source.write_text("synthetic prompt\n", encoding="utf-8")
+        args = SimpleNamespace(codex_dir=str(root), dry_run=False)
+        with patch.object(
+            codex_instruct, "atomic_write_text", wraps=codex_instruct.atomic_write_text
+        ) as write, patch("builtins.print"):
+            self.assertEqual(codex_instruct.deploy_prompt(args, source, "custom.md"), 0)
+        calls = {call.args[0]: call.kwargs for call in write.call_args_list}
+        self.assertTrue(calls[config_path]["preserve_newlines"])
+        self.assertFalse(calls[root / "custom.md"].get("preserve_newlines", False))
+        self.assertFalse(
+            calls[codex_instruct.state_file_path(config_path)].get("preserve_newlines", False)
+        )
+        with patch.object(os, "fdopen", wraps=os.fdopen) as fdopen:
+            codex_instruct.atomic_write_text(root / "exact.txt", "one\r\ntwo\n", preserve_newlines=True)
+            self.assertEqual(fdopen.call_args.kwargs["newline"], "")
+            codex_instruct.atomic_write_text(root / "default.txt", "ordinary text\n")
+            self.assertIsNone(fdopen.call_args.kwargs["newline"])
+        self.assertEqual((root / "exact.txt").read_bytes(), b"one\r\ntwo\n")
+
     # An invalid state file cannot nominate config.toml or another non-Markdown file for deletion.
     def test_tampered_state_cannot_nominate_config_for_deletion(self) -> None:
         temporary_directory, config_path = self.make_config(
