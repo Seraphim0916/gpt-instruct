@@ -113,9 +113,21 @@ class CodexDiscoveryTests(unittest.TestCase):
 
 
 class ManagedConfigTests(unittest.TestCase):
+    def test_temporary_home_alias_has_canonical_expected_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            actual = root / "actual"
+            actual.mkdir()
+            alias = root / "alias"
+            alias.symlink_to(actual, target_is_directory=True)
+            with patch.object(tempfile, "tempdir", str(alias)):
+                directory, config = self.make_config("")
+                self.addCleanup(directory.cleanup)
+                self.assertEqual(config, config.resolve())
+
     def make_config(self, text: str) -> tuple[tempfile.TemporaryDirectory[str], Path]:
         temporary_directory = tempfile.TemporaryDirectory()
-        config_path = Path(temporary_directory.name) / "config.toml"
+        config_path = Path(temporary_directory.name).resolve() / "config.toml"
         config_path.write_text(text, encoding="utf-8")
         return temporary_directory, config_path
 
@@ -820,7 +832,7 @@ class ManagedConfigTests(unittest.TestCase):
     def test_reset_preserves_replacement_prompt_symlinks_without_reading_targets(self) -> None:
         for target_kind in ["matching", "modified", "missing"]:
             with self.subTest(target_kind=target_kind), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
+                root = Path(temporary).resolve()
                 home = root / "codex-home"
                 home.mkdir()
                 config_path = home / "config.toml"
