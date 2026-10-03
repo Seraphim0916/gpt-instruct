@@ -20,7 +20,12 @@ import sys
 import tempfile
 import unicodedata
 import zipfile
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.8-3.10
+    import tomli as tomllib
 from datetime import datetime
+from contextlib import contextmanager
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -133,7 +138,7 @@ def find_codex_dirs() -> list[Path]:
     if env_home:
         candidates.add(Path(env_home).expanduser())
     candidates.add(Path.home() / ".codex")
-    return sorted(path.resolve() for path in candidates if (path / "config.toml").exists())
+    return sorted({path.resolve() for path in candidates if (path / "config.toml").exists()})
 
 
 def selected_codex_dirs(codex_dir: str | None) -> list[Path]:
@@ -158,11 +163,19 @@ def state_file_path(config_path: Path) -> Path:
 
 
 def is_safe_prompt_filename(filename: object) -> bool:
+    """Accept a basename safe for a single-line, double-quoted TOML value."""
     return (
         isinstance(filename, str)
         and bool(filename)
         and "/" not in filename
         and "\\" not in filename
+        # Exclude scanner line boundaries and invalid UTF-8 surrogate code points.
+        and not any(
+            ord(char) < 32
+            or 0xD800 <= ord(char) <= 0xDFFF
+            or char in '"\x7f\x85\u2028\u2029'
+            for char in filename
+        )
         and filename.lower().endswith(".md")
         and Path(filename).name == filename
     )
@@ -189,12 +202,87 @@ def is_valid_instruction_line(line: object) -> bool:
     )
 
 
+def quoted_root_key(line: str) -> str | None:
+    """Decode only a leading quoted key token, including TOML Unicode escapes."""
+    match = re.match(r"""^\s*("(?:\\.|[^"\\])*"|'[^']*')\s*(?=[=.])""", line)
+    if match is None:
+        return None
+    token = match.group(1)
+    if token.startswith("'"):
+        return token[1:-1]
+    escapes = {"b": "\b", "t": "\t", "n": "\n", "f": "\f", "r": "\r", '"': '"', "\\": "\\"}
+
+    def decode(escape_match: re.Match[str]) -> str:
+        escape = escape_match.group(1)
+        return chr(int(escape[1:], 16)) if escape[0] in "uU" else escapes[escape]
+
+    return re.sub(r'\\(u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|["\\btnfr])', decode, token[1:-1])
+
+
+def split_toml_lines(text: str) -> list[str]:
+    """Split only at TOML LF/CRLF boundaries, preserving every input character."""
+    parts = text.split("\n")
+    return [part + "\n" for part in parts[:-1]] + ([parts[-1]] if parts[-1] else [])
+
+
+def root_config_statements(lines: list[str]) -> tuple[list[tuple[int, int]], int]:
+    """Locate root statement spans without interpreting or reserializing TOML values."""
+    statements: list[tuple[int, int]] = []
+    quote = ""
+    depth = 0
+    start = 0
+    for line_index, line in enumerate(lines):
+        if not quote and depth == 0:
+            stripped = line.lstrip()
+            if quoted_root_key(line) == "model_instructions_file" or re.match(
+                r"^\s*model_instructions_file\s*\.", line
+            ):
+                raise ValueError("model_instructions_file must use its bare, undotted key")
+            if stripped.startswith("["):
+                return statements, line_index
+            if not stripped or stripped.startswith("#"):
+                continue
+            start = line_index
+        index = 0
+        while index < len(line):
+            char = line[index]
+            if quote:
+                if quote[0] == '"' and char == "\\":
+                    index += 2
+                    continue
+                if line.startswith(quote, index):
+                    end = index + len(quote)
+                    if len(quote) == 3:
+                        # Four/five closing quotes include one/two literal quotes.
+                        while end < len(line) and line[end] == quote[0]:
+                            end += 1
+                    quote = ""
+                    index = end
+                    continue
+            elif char == "#":
+                break
+            elif char in "\"'":
+                quote = char * 3 if line.startswith(char * 3, index) else char
+                index += len(quote)
+                continue
+            elif char in "[{":
+                depth += 1
+            elif char in "]}":
+                depth -= 1
+            index += 1
+        if not quote and depth == 0:
+            if line_index > start and re.match(r"^\s*model_instructions_file\s*=", lines[start]):
+                raise ValueError("model_instructions_file must use a single-line TOML value")
+            statements.append((start, line_index + 1))
+    return statements, len(lines)
+
+
 def top_level_model_instructions_line(text: str) -> str | None:
     """Return the root model_instructions_file assignment, ignoring TOML tables."""
-    for line in text.splitlines():
-        stripped = line.lstrip()
-        if stripped.startswith("["):
-            break
+    lines = split_toml_lines(text)
+    statements, _table_index = root_config_statements(lines)
+    for start, _end in statements:
+        line = lines[start].rstrip("\r\n")
         if re.match(r"^\s*model_instructions_file\s*=", line):
             return line
     return None
@@ -203,10 +291,12 @@ def top_level_model_instructions_line(text: str) -> str | None:
 def line_references_managed_prompt(line: str | None, filenames: set[str]) -> bool:
     if not line:
         return False
-    match = MODEL_INSTRUCTIONS_PATTERN.fullmatch(line)
-    if not match:
+    try:
+        reference = tomllib.loads(line).get("model_instructions_file")
+    except ValueError:
         return False
-    reference = match.group(2).replace("\\", "/")
+    if not isinstance(reference, str):
+        return False
     if reference.startswith("./"):
         reference = reference[2:]
     if "/" in reference:
@@ -216,15 +306,12 @@ def line_references_managed_prompt(line: str | None, filenames: set[str]) -> boo
 
 def replace_top_level_model_instructions(text: str, replacement: str | None) -> str:
     """Replace only the root assignment while preserving all unrelated TOML text."""
-    lines = text.splitlines(keepends=True)
-    table_index = next(
-        (index for index, line in enumerate(lines) if line.lstrip().startswith("[")),
-        len(lines),
-    )
+    lines = split_toml_lines(text)
+    statements, table_index = root_config_statements(lines)
     assignment_indexes = [
-        index
-        for index, line in enumerate(lines[:table_index])
-        if re.match(r"^\s*model_instructions_file\s*=", line)
+        start
+        for start, _end in statements
+        if re.match(r"^\s*model_instructions_file\s*=", lines[start])
     ]
 
     if assignment_indexes:
@@ -247,9 +334,9 @@ def replace_top_level_model_instructions(text: str, replacement: str | None) -> 
 
     insert_at = next(
         (
-            index + 1
-            for index, line in enumerate(lines[:table_index])
-            if re.match(r"^\s*model\s*=", line)
+            end
+            for start, end in statements
+            if re.match(r"^\s*model\s*=", lines[start])
         ),
         table_index,
     )
@@ -260,7 +347,15 @@ def replace_top_level_model_instructions(text: str, replacement: str | None) -> 
     return "".join(lines)
 
 
-def atomic_write_text(path: Path, text: str, *, follow_symlink: bool = False) -> None:
+def read_config_text(path: Path) -> str:
+    """Read configuration text without translating its existing newline characters."""
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return handle.read()
+
+
+def atomic_write_text(
+    path: Path, text: str, *, follow_symlink: bool = False, preserve_newlines: bool = False,
+) -> None:
     """Atomically update text, following symlinks only for explicitly trusted paths."""
     if path.is_symlink() and not follow_symlink:
         raise OSError(f"refusing to overwrite symlink: {path}")
@@ -272,7 +367,9 @@ def atomic_write_text(path: Path, text: str, *, follow_symlink: bool = False) ->
     )
     temporary_path = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        with os.fdopen(
+            descriptor, "w", encoding="utf-8", newline="" if preserve_newlines else None,
+        ) as handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
@@ -335,7 +432,7 @@ def previous_instruction_from_legacy_baseline(config_path: Path) -> str | None:
     baseline = baseline_backup_path(config_path)
     if not baseline.exists():
         return None
-    line = top_level_model_instructions_line(baseline.read_text(encoding="utf-8"))
+    line = top_level_model_instructions_line(read_config_text(baseline))
     if line_references_managed_prompt(line, MANAGED_PROMPT_FILENAMES):
         return None
     return line
@@ -350,7 +447,7 @@ def prepare_deployment_state(
     state = read_state(config_path)
     if state is None:
         current_line = top_level_model_instructions_line(
-            config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+            read_config_text(config_path) if config_path.exists() else ""
         )
         if line_references_managed_prompt(
             current_line,
@@ -380,11 +477,11 @@ def prepare_deployment_state(
 
 
 def set_model_instructions(config_path: Path, md_filename: str) -> bool:
-    text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    text = read_config_text(config_path) if config_path.exists() else ""
     target = f'model_instructions_file = "./{md_filename}"'
     new_text = replace_top_level_model_instructions(text, target)
     if new_text != text:
-        atomic_write_text(config_path, new_text, follow_symlink=True)
+        atomic_write_text(config_path, new_text, follow_symlink=True, preserve_newlines=True)
         return True
     return False
 
@@ -400,7 +497,7 @@ def restore_managed_model_instructions(config_path: Path) -> tuple[bool, str]:
         if isinstance(stored_prompts, dict):
             managed_filenames.update(stored_prompts)
 
-    text = config_path.read_text(encoding="utf-8")
+    text = read_config_text(config_path)
     current_line = top_level_model_instructions_line(text)
     if not line_references_managed_prompt(current_line, managed_filenames):
         return False, "not-managed"
@@ -413,7 +510,7 @@ def restore_managed_model_instructions(config_path: Path) -> tuple[bool, str]:
 
     new_text = replace_top_level_model_instructions(text, previous_line)
     if new_text != text:
-        atomic_write_text(config_path, new_text, follow_symlink=True)
+        atomic_write_text(config_path, new_text, follow_symlink=True, preserve_newlines=True)
         return True, "restored" if previous_line else "removed"
     return False, "unchanged"
 
@@ -439,13 +536,65 @@ def read_prompt(source_path: Path, expected_md_filename: str) -> str:
             return extracted_path.read_text(encoding="utf-8")
 
 
+@contextmanager
+def deployment_transaction(config_path: Path, destination: Path):
+    """Keep restorable bytes and modes until this directory's deployment succeeds."""
+    directory = config_path.parent
+    recovery = Path(tempfile.mkdtemp(prefix=".gpt-instruct-rollback-", dir=directory))
+    saved = []
+    snapshots = set(directory.glob(config_path.name + ".bak_*"))
+    keep_recovery = False
+    try:
+        for index, path in enumerate((config_path.resolve(),
+                                      state_file_path(config_path), destination)):
+            backup = recovery / str(index) if path.exists() else None
+            if backup is not None:
+                shutil.copy2(path, backup)
+            saved.append((path, backup))
+        yield
+    except BaseException:
+        try:
+            for path, backup in reversed(saved):
+                if backup is not None:
+                    os.replace(backup, path)
+                elif path.exists():
+                    path.unlink()
+            for snapshot in set(directory.glob(config_path.name + ".bak_*")) - snapshots:
+                snapshot.unlink()
+        except OSError:
+            keep_recovery = True
+            print(f"[Error] Rollback incomplete; recovery copies: {recovery}", file=sys.stderr)
+            raise
+        raise
+    finally:
+        if not keep_recovery:
+            shutil.rmtree(recovery)
+
+
+def precheck_deployment(config_path: Path) -> None:
+    """Validate every input that can refuse deployment before creating artifacts."""
+    for path in (config_path, baseline_backup_path(config_path)):
+        if not path.exists():
+            continue
+        text = read_config_text(path)
+        parsed = tomllib.loads(text)
+        if "model_instructions_file" in parsed and not isinstance(
+            parsed["model_instructions_file"], str
+        ):
+            raise ValueError("model_instructions_file must be a string assignment")
+        top_level_model_instructions_line(text)
+
+
 def deploy_prompt(
     args: argparse.Namespace,
     prompt_path: Path,
     md_filename: str,
 ) -> int:
     if not is_safe_prompt_filename(md_filename):
-        print(f"[错误] 目标名称必须是不含路径的 .md 文件名: {md_filename}", file=sys.stderr)
+        print(
+            f"[错误] 目标名称必须是有效 UTF-8 且不含路径、双引号或控制/换行字符的 .md 文件名: {md_filename!r}",
+            file=sys.stderr,
+        )
         return 2
     if not prompt_path.exists():
         print(f"[错误] 提示词文件不存在: {prompt_path}", file=sys.stderr)
@@ -471,13 +620,15 @@ def deploy_prompt(
         print(f"  写入 / Write: {destination}")
         print(f'  配置 / Config: model_instructions_file = "./{md_filename}"')
         print("  兼容模式 / Compatibility: 仅修改本项目管理的配置项")
-        if args.dry_run:
-            continue
-
-        codex_dir.mkdir(parents=True, exist_ok=True)
-        if not config_path.exists():
-            atomic_write_text(config_path, "", follow_symlink=True)
-            print("  创建 / Created: config.toml")
+        try:
+            if config_path.resolve().parent != codex_dir.resolve():
+                raise ValueError("Deployment requires a single config directory")
+            if destination.is_symlink():
+                raise ValueError("Destination must not be a symlink")
+            precheck_deployment(config_path)
+        except ValueError as exc:
+            print(f"[Error] Deployment cannot proceed: {exc}", file=sys.stderr)
+            return 2
 
         if state_file_path(config_path).is_symlink():
             print(
@@ -489,9 +640,13 @@ def deploy_prompt(
 
         state = read_state(config_path)
         tracked_prompts = state.get("managed_prompts", {}) if state else {}
-        current_line = top_level_model_instructions_line(
-            config_path.read_text(encoding="utf-8")
-        )
+        try:
+            current_line = top_level_model_instructions_line(
+                read_config_text(config_path) if config_path.exists() else ""
+            )
+        except ValueError as exc:
+            print(f"[错误] Unsupported configuration: {exc}", file=sys.stderr)
+            return 2
         legacy_owned = state is None and line_references_managed_prompt(
             current_line,
             {md_filename},
@@ -512,17 +667,24 @@ def deploy_prompt(
             )
             return 2
 
-        snapshot = backup_file(config_path)
-        print(f"  已创建操作前备份 / Snapshot saved: {snapshot.name}")
+        if args.dry_run:
+            continue
+        codex_dir.mkdir(parents=True, exist_ok=True)
+        with deployment_transaction(config_path, destination):
+            if not config_path.exists():
+                atomic_write_text(config_path, "", follow_symlink=True, preserve_newlines=True)
+                print("  创建 / Created: config.toml")
+            snapshot = backup_file(config_path)
+            print(f"  已创建操作前备份 / Snapshot saved: {snapshot.name}")
 
-        prepare_deployment_state(
-            config_path,
-            md_filename,
-            prompt_text,
-            existed_before=destination.exists() or destination.is_symlink(),
-        )
-        atomic_write_text(destination, prompt_text)
-        changed = set_model_instructions(config_path, md_filename)
+            prepare_deployment_state(
+                config_path,
+                md_filename,
+                prompt_text,
+                existed_before=destination.exists() or destination.is_symlink(),
+            )
+            atomic_write_text(destination, prompt_text)
+            changed = set_model_instructions(config_path, md_filename)
         print("  状态 / Status:", "已更新 / Updated" if changed else "已是最新 / Already current")
     return 0
 
@@ -587,7 +749,7 @@ def restore_config_snapshot(args: argparse.Namespace, snapshot: Path) -> int:
         return 2
 
     try:
-        snapshot_text = snapshot.read_text(encoding="utf-8")
+        snapshot_text = read_config_text(snapshot)
     except (OSError, UnicodeError) as exc:
         print(f"[错误] 无法读取快照 / Failed to read snapshot: {exc}", file=sys.stderr)
         return 2
@@ -605,7 +767,7 @@ def restore_config_snapshot(args: argparse.Namespace, snapshot: Path) -> int:
     if config_path.exists():
         safety_snapshot = backup_file(config_path)
         print(f"  已备份当前配置 / Current config saved: {safety_snapshot.name}")
-    atomic_write_text(config_path, snapshot_text, follow_symlink=True)
+    atomic_write_text(config_path, snapshot_text, follow_symlink=True, preserve_newlines=True)
     print("  已完整恢复 config.toml / Full config.toml restored.")
     return 0
 
@@ -619,9 +781,30 @@ def reset_managed_install(args: argparse.Namespace) -> int:
     for codex_dir in codex_dirs:
         config_path = codex_dir / "config.toml"
         print(f"\n── 目标 / Target: {codex_dir} ──")
+        try:
+            if config_path.exists():
+                top_level_model_instructions_line(read_config_text(config_path))
+        except ValueError as exc:
+            print(f"[错误] Unsupported configuration: {exc}", file=sys.stderr)
+            return 2
         state = read_state(config_path)
         managed_prompts = state.get("managed_prompts", {}) if state else {}
         assert isinstance(managed_prompts, dict)
+
+        try:
+            text = read_config_text(config_path) if config_path.exists() else ""
+            reference = tomllib.loads(text).get("model_instructions_file")
+            current_line = top_level_model_instructions_line(text)
+            if isinstance(reference, str) and not line_references_managed_prompt(
+                current_line, set(managed_prompts)
+            ):
+                referenced_path = (codex_dir / reference).resolve()
+                if any(referenced_path == (codex_dir / name).resolve()
+                       for name in managed_prompts):
+                    raise ValueError("Config still references a managed prompt; reset refused")
+        except ValueError as exc:
+            print(f"[Error] Reset cannot proceed: {exc}", file=sys.stderr)
+            return 2
 
         if not confirm_reset():
             print("  未确认，已取消 / Confirmation not received; reset cancelled.")
@@ -662,6 +845,7 @@ def reset_managed_install(args: argparse.Namespace) -> int:
             try:
                 digest_matches = (
                     not existed_before
+                    and not prompt_path.is_symlink()
                     and prompt_path.is_file()
                     and bool(expected_digest)
                     and file_sha256(prompt_path) == expected_digest
@@ -671,7 +855,7 @@ def reset_managed_install(args: argparse.Namespace) -> int:
             if digest_matches:
                 prompt_path.unlink()
                 removed += 1
-            elif prompt_path.exists():
+            elif prompt_path.exists() or prompt_path.is_symlink():
                 preserved += 1
                 reason = (
                     "部署前已存在 / pre-existing"
@@ -715,7 +899,7 @@ def inferred_md_filename(source: Path, requested_name: str | None) -> str:
     return f"{source.stem}.md"
 
 
-def main() -> int:
+def run_cli() -> int:
     parser = argparse.ArgumentParser(
         description="Extract, deploy, or reset a packaged gpt-instruct Codex instruction file."
     )
@@ -772,6 +956,14 @@ def main() -> int:
     _, version = action.split(":", 1)
     prompt_archive, prompt_md_filename = PROMPT_VERSIONS[version]
     return deploy_prompt(args, prompt_archive, prompt_md_filename)
+
+
+def main() -> int:
+    try:
+        return run_cli()
+    except OSError as exc:
+        print(f"[错误] 文件操作失败 / File operation failed: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
