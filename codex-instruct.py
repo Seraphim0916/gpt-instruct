@@ -25,6 +25,7 @@ try:
 except ModuleNotFoundError:  # Python 3.8-3.10
     import tomli as tomllib
 from datetime import datetime
+from contextlib import contextmanager
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -535,6 +536,41 @@ def read_prompt(source_path: Path, expected_md_filename: str) -> str:
             return extracted_path.read_text(encoding="utf-8")
 
 
+@contextmanager
+def deployment_transaction(config_path: Path, destination: Path):
+    """Keep restorable bytes and modes until this directory's deployment succeeds."""
+    directory = config_path.parent
+    recovery = Path(tempfile.mkdtemp(prefix=".gpt-instruct-rollback-", dir=directory))
+    saved = []
+    snapshots = set(directory.glob(config_path.name + ".bak_*"))
+    keep_recovery = False
+    try:
+        for index, path in enumerate((config_path.resolve(),
+                                      state_file_path(config_path), destination)):
+            backup = recovery / str(index) if path.exists() else None
+            if backup is not None:
+                shutil.copy2(path, backup)
+            saved.append((path, backup))
+        yield
+    except BaseException:
+        try:
+            for path, backup in reversed(saved):
+                if backup is not None:
+                    os.replace(backup, path)
+                elif path.exists():
+                    path.unlink()
+            for snapshot in set(directory.glob(config_path.name + ".bak_*")) - snapshots:
+                snapshot.unlink()
+        except OSError:
+            keep_recovery = True
+            print(f"[Error] Rollback incomplete; recovery copies: {recovery}", file=sys.stderr)
+            raise
+        raise
+    finally:
+        if not keep_recovery:
+            shutil.rmtree(recovery)
+
+
 def precheck_deployment(config_path: Path) -> None:
     """Validate every input that can refuse deployment before creating artifacts."""
     for path in (config_path, baseline_backup_path(config_path)):
@@ -585,6 +621,10 @@ def deploy_prompt(
         print(f'  配置 / Config: model_instructions_file = "./{md_filename}"')
         print("  兼容模式 / Compatibility: 仅修改本项目管理的配置项")
         try:
+            if config_path.resolve().parent != codex_dir.resolve():
+                raise ValueError("Deployment requires a single config directory")
+            if destination.is_symlink():
+                raise ValueError("Destination must not be a symlink")
             precheck_deployment(config_path)
         except ValueError as exc:
             print(f"[Error] Deployment cannot proceed: {exc}", file=sys.stderr)
@@ -630,20 +670,21 @@ def deploy_prompt(
         if args.dry_run:
             continue
         codex_dir.mkdir(parents=True, exist_ok=True)
-        if not config_path.exists():
-            atomic_write_text(config_path, "", follow_symlink=True, preserve_newlines=True)
-            print("  创建 / Created: config.toml")
-        snapshot = backup_file(config_path)
-        print(f"  已创建操作前备份 / Snapshot saved: {snapshot.name}")
+        with deployment_transaction(config_path, destination):
+            if not config_path.exists():
+                atomic_write_text(config_path, "", follow_symlink=True, preserve_newlines=True)
+                print("  创建 / Created: config.toml")
+            snapshot = backup_file(config_path)
+            print(f"  已创建操作前备份 / Snapshot saved: {snapshot.name}")
 
-        prepare_deployment_state(
-            config_path,
-            md_filename,
-            prompt_text,
-            existed_before=destination.exists() or destination.is_symlink(),
-        )
-        atomic_write_text(destination, prompt_text)
-        changed = set_model_instructions(config_path, md_filename)
+            prepare_deployment_state(
+                config_path,
+                md_filename,
+                prompt_text,
+                existed_before=destination.exists() or destination.is_symlink(),
+            )
+            atomic_write_text(destination, prompt_text)
+            changed = set_model_instructions(config_path, md_filename)
         print("  状态 / Status:", "已更新 / Updated" if changed else "已是最新 / Already current")
     return 0
 

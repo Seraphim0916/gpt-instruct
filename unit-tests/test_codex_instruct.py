@@ -133,6 +133,68 @@ class ManagedConfigTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 2, result.stderr)
                     self.assertEqual(self.fixture_contents(root), before)
 
+    def assert_failed_deployment_restored(self, redeploy: bool) -> None:
+        for step in ("state", "prompt", "config"):
+            for after_write in (False, True):
+                with self.subTest(step=step, after_write=after_write):
+                    directory, config = self.make_config('model = "fixture"\r\n')
+                    with directory:
+                        root = config.parent
+                        source = root / "source.md"
+                        source.write_text("old prompt\n", encoding="utf-8")
+                        args = SimpleNamespace(codex_dir=str(root), dry_run=False)
+                        with patch("builtins.print"):
+                            if redeploy:
+                                self.assertEqual(codex_instruct.deploy_prompt(
+                                    args, source, "custom.md"), 0)
+                        config.chmod(0o640)
+                        if redeploy:
+                            (root / "custom.md").chmod(0o640)
+                            # Force a real config rewrite on redeployment too.
+                            config.write_bytes(b'model = "fixture"\r\n'
+                                               b"model_instructions_file = './custom.md'\r\n")
+                        source.write_text("new prompt\n", encoding="utf-8")
+                        before = self.fixture_contents(root)
+                        modes = {p.name: p.stat().st_mode for p in root.iterdir()}
+                        failed_path = {"state": codex_instruct.state_file_path(config),
+                                       "prompt": root / "custom.md", "config": config}[step]
+                        original_write = codex_instruct.atomic_write_text
+                        def failing_write(path, text, **kwargs):
+                            if path == failed_path:
+                                if after_write:
+                                    original_write(path, text, **kwargs)
+                                raise OSError("injected " + step + " write failure")
+                            return original_write(path, text, **kwargs)
+                        with patch.object(codex_instruct, "atomic_write_text",
+                                          side_effect=failing_write), patch("builtins.print"):
+                            with self.assertRaisesRegex(OSError, "injected"):
+                                codex_instruct.deploy_prompt(args, source, "custom.md")
+                        self.assertEqual(self.fixture_contents(root), before)
+                        self.assertEqual({p.name: p.stat().st_mode for p in root.iterdir()},
+                                         modes)
+
+    def test_failed_initial_deployment_restores_directory(self) -> None:
+        self.assert_failed_deployment_restored(False)
+
+    def test_failed_redeployment_restores_existing_prompt_and_state(self) -> None:
+        self.assert_failed_deployment_restored(True)
+
+    def test_known_limitation_missing_final_model_newline(self) -> None:
+        # Known limitation: insertion adds a newline that reset does not remove.
+        text = 'model = "fixture"'
+        deployed = codex_instruct.replace_top_level_model_instructions(
+            text, 'model_instructions_file = "./custom.md"')
+        self.assertEqual(codex_instruct.replace_top_level_model_instructions(
+            deployed, None), text + "\n")
+
+    def test_known_limitation_missing_final_other_root_newline(self) -> None:
+        # Known limitation: the same extra newline occurs without a model key.
+        text = 'model_provider = "fixture"'
+        deployed = codex_instruct.replace_top_level_model_instructions(
+            text, 'model_instructions_file = "./custom.md"')
+        self.assertEqual(codex_instruct.replace_top_level_model_instructions(
+            deployed, None), text + "\n")
+
     def test_reset_decodes_equivalent_toml_prompt_strings(self) -> None:
         values = ('"\\u002e/custom\\u002emd"', '"\\u002e\\u002fcustom.md"',
                   "'./custom.md'", '"""./custom.md"""', "'''./custom.md'''")
