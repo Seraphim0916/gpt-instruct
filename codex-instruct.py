@@ -20,6 +20,10 @@ import sys
 import tempfile
 import unicodedata
 import zipfile
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.8-3.10
+    import tomli as tomllib
 from datetime import datetime
 from pathlib import Path
 
@@ -529,6 +533,20 @@ def read_prompt(source_path: Path, expected_md_filename: str) -> str:
             return extracted_path.read_text(encoding="utf-8")
 
 
+def precheck_deployment(config_path: Path) -> None:
+    """Validate every input that can refuse deployment before creating artifacts."""
+    for path in (config_path, baseline_backup_path(config_path)):
+        if not path.exists():
+            continue
+        text = read_config_text(path)
+        parsed = tomllib.loads(text)
+        if "model_instructions_file" in parsed and not isinstance(
+            parsed["model_instructions_file"], str
+        ):
+            raise ValueError("model_instructions_file must be a string assignment")
+        top_level_model_instructions_line(text)
+
+
 def deploy_prompt(
     args: argparse.Namespace,
     prompt_path: Path,
@@ -564,13 +582,11 @@ def deploy_prompt(
         print(f"  写入 / Write: {destination}")
         print(f'  配置 / Config: model_instructions_file = "./{md_filename}"')
         print("  兼容模式 / Compatibility: 仅修改本项目管理的配置项")
-        if args.dry_run:
-            continue
-
-        codex_dir.mkdir(parents=True, exist_ok=True)
-        if not config_path.exists():
-            atomic_write_text(config_path, "", follow_symlink=True, preserve_newlines=True)
-            print("  创建 / Created: config.toml")
+        try:
+            precheck_deployment(config_path)
+        except ValueError as exc:
+            print(f"[Error] Deployment cannot proceed: {exc}", file=sys.stderr)
+            return 2
 
         if state_file_path(config_path).is_symlink():
             print(
@@ -584,7 +600,7 @@ def deploy_prompt(
         tracked_prompts = state.get("managed_prompts", {}) if state else {}
         try:
             current_line = top_level_model_instructions_line(
-                read_config_text(config_path)
+                read_config_text(config_path) if config_path.exists() else ""
             )
         except ValueError as exc:
             print(f"[错误] Unsupported configuration: {exc}", file=sys.stderr)
@@ -609,6 +625,12 @@ def deploy_prompt(
             )
             return 2
 
+        if args.dry_run:
+            continue
+        codex_dir.mkdir(parents=True, exist_ok=True)
+        if not config_path.exists():
+            atomic_write_text(config_path, "", follow_symlink=True, preserve_newlines=True)
+            print("  创建 / Created: config.toml")
         snapshot = backup_file(config_path)
         print(f"  已创建操作前备份 / Snapshot saved: {snapshot.name}")
 

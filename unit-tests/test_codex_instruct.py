@@ -113,6 +113,51 @@ class CodexDiscoveryTests(unittest.TestCase):
 
 
 class ManagedConfigTests(unittest.TestCase):
+    def assert_deployment_refused_unchanged(self, config: str, baseline=None) -> None:
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run):
+                directory, config_path = self.make_config(config)
+                with directory:
+                    root = config_path.parent
+                    source = root / "source.md"
+                    source.write_text("synthetic prompt\n", encoding="utf-8")
+                    if baseline is not None:
+                        codex_instruct.baseline_backup_path(config_path).write_text(
+                            baseline, encoding="utf-8"
+                        )
+                    before = self.fixture_contents(root)
+                    arguments = ["--file", str(source), "--name", "custom.md",
+                                 "--codex-dir", str(root)]
+                    if dry_run:
+                        arguments.append("--dry-run")
+                    result = self.run_cli_in_fixture(root, arguments)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertEqual(self.fixture_contents(root), before)
+
+    def test_deploy_refuses_unterminated_config_before_writes(self) -> None:
+        for text in ('model = "unfinished', 'values = [1, 2',
+                     'value = { a = 1', 'value = """unfinished',
+                     '[features]\nvalue = "unfinished'):
+            with self.subTest(text=text):
+                self.assert_deployment_refused_unchanged(text)
+
+    def test_deploy_refuses_instruction_tables_before_writes(self) -> None:
+        for header in ('[model_instructions_file]', '[[model_instructions_file]]',
+                       '["model_instructions_file"]',
+                       '[model_instructions_file.nested]'):
+            with self.subTest(header=header):
+                self.assert_deployment_refused_unchanged(header + '\nvalue = "x"\n')
+
+    def test_deploy_refuses_unsupported_legacy_baseline_before_writes(self) -> None:
+        for baseline in ('"model_instructions_file" = "./old.md"\n',
+                         'model_instructions_file.path = "./old.md"\n',
+                         'model_instructions_file = """\n./old.md\n"""\n'):
+            with self.subTest(baseline=baseline):
+                self.assert_deployment_refused_unchanged(
+                    'model_instructions_file = "./custom.md"\n', baseline
+                )
+
     def test_temporary_home_alias_has_canonical_expected_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
