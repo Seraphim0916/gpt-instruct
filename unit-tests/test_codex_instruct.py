@@ -113,6 +113,50 @@ class CodexDiscoveryTests(unittest.TestCase):
 
 
 class ManagedConfigTests(unittest.TestCase):
+    def test_reset_refuses_unrecognized_equivalent_paths_before_writes(self) -> None:
+        for absolute in (False, True):
+            with self.subTest(absolute=absolute):
+                directory, config = self.make_config('model = "fixture"\n')
+                with directory:
+                    root = config.parent
+                    source = root / "source.md"
+                    source.write_text("synthetic prompt\n", encoding="utf-8")
+                    result = self.run_cli_in_fixture(root, ["--file", str(source),
+                        "--name", "custom.md", "--codex-dir", str(root)])
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    reference = str(root / "custom.md") if absolute else "././custom.md"
+                    config.write_text('model_instructions_file = ' + json.dumps(reference)
+                                      + '\n', encoding="utf-8")
+                    before = self.fixture_contents(root)
+                    result = self.run_cli_in_fixture(root,
+                        ["--reset", "--codex-dir", str(root)], answer="y\n")
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(self.fixture_contents(root), before)
+
+    def test_reset_decodes_equivalent_toml_prompt_strings(self) -> None:
+        values = ('"\\u002e/custom\\u002emd"', '"\\u002e\\u002fcustom.md"',
+                  "'./custom.md'", '"""./custom.md"""', "'''./custom.md'''")
+        for value in values:
+            with self.subTest(value=value):
+                directory, config = self.make_config('model = "fixture"\n')
+                with directory:
+                    root = config.parent
+                    source = root / "source.md"
+                    source.write_text("synthetic prompt\n", encoding="utf-8")
+                    args = ["--file", str(source), "--name", "custom.md",
+                            "--codex-dir", str(root)]
+                    self.assertEqual(self.run_cli_in_fixture(root, args).returncode, 0)
+                    config.write_text('model = "fixture"\nmodel_instructions_file = '
+                                      + value + ' # hand edited\n', encoding="utf-8")
+                    result = self.run_cli_in_fixture(
+                        root, ["--reset", "--codex-dir", str(root)], answer="y\n"
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(config.read_text(encoding="utf-8"),
+                                     'model = "fixture"\n')
+                    self.assertFalse((root / "custom.md").exists())
+                    self.assertFalse(codex_instruct.state_file_path(config).exists())
+
     def assert_deployment_refused_unchanged(self, config: str, baseline=None) -> None:
         for dry_run in (False, True):
             with self.subTest(dry_run=dry_run):

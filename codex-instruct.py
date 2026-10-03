@@ -290,10 +290,12 @@ def top_level_model_instructions_line(text: str) -> str | None:
 def line_references_managed_prompt(line: str | None, filenames: set[str]) -> bool:
     if not line:
         return False
-    match = MODEL_INSTRUCTIONS_PATTERN.fullmatch(line)
-    if not match:
+    try:
+        reference = tomllib.loads(line).get("model_instructions_file")
+    except ValueError:
         return False
-    reference = match.group(2).replace("\\", "/")
+    if not isinstance(reference, str):
+        return False
     if reference.startswith("./"):
         reference = reference[2:]
     if "/" in reference:
@@ -747,6 +749,21 @@ def reset_managed_install(args: argparse.Namespace) -> int:
         state = read_state(config_path)
         managed_prompts = state.get("managed_prompts", {}) if state else {}
         assert isinstance(managed_prompts, dict)
+
+        try:
+            text = read_config_text(config_path) if config_path.exists() else ""
+            reference = tomllib.loads(text).get("model_instructions_file")
+            current_line = top_level_model_instructions_line(text)
+            if isinstance(reference, str) and not line_references_managed_prompt(
+                current_line, set(managed_prompts)
+            ):
+                referenced_path = (codex_dir / reference).resolve()
+                if any(referenced_path == (codex_dir / name).resolve()
+                       for name in managed_prompts):
+                    raise ValueError("Config still references a managed prompt; reset refused")
+        except ValueError as exc:
+            print(f"[Error] Reset cannot proceed: {exc}", file=sys.stderr)
+            return 2
 
         if not confirm_reset():
             print("  未确认，已取消 / Confirmation not received; reset cancelled.")
